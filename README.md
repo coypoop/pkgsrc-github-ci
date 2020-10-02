@@ -1,5 +1,9 @@
 pkgsrc CI bot.
 
+## Warning
+
+It is trivially easy to "pwn" your server with a pull request. Make sure to use a disposable server.
+
 ## Install
 
 1. Register a GitHub app
