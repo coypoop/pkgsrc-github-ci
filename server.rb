@@ -1,3 +1,4 @@
+require 'bundler/setup'
 require 'sinatra'
 require 'octokit'
 require 'dotenv/load' # Manages environment variables
@@ -11,10 +12,27 @@ require 'git'
 set :port, 3000
 set :bind, '0.0.0.0'
 
+
+# This is template code to create a GitHub App server.
+# You can read more about GitHub Apps here: # https://developer.github.com/apps/
+#
+# On its own, this app does absolutely nothing, except that it can be installed.
+# It's up to you to add functionality!
+# You can check out one example in advanced_server.rb.
+#
+# This code is a Sinatra app, for two reasons:
+#   1. Because the app will require a landing page for installation.
+#   2. To easily handle webhook events.
+#
+# Of course, not all apps need to receive and process events!
+# Feel free to rip out the event handling code if you don't need it.
+#
+# Have fun!
+#
+
 class GHAapp < Sinatra::Application
 
-  # Converts the newlines. Expects that the private key has been set as an
-  # environment variable in PEM format.
+  # Expects that the private key in PEM format. Converts the newlines
   PRIVATE_KEY = OpenSSL::PKey::RSA.new(ENV['GITHUB_PRIVATE_KEY'].gsub('\n', "\n"))
 
   # Your registered app must have a secret set. The secret is used to verify
@@ -29,51 +47,42 @@ class GHAapp < Sinatra::Application
     set :logging, Logger::DEBUG
   end
 
+  get '/logs/' do
+      File.read(File.join('public', 'index.html'))
+  end
 
-  # Executed before each request to the `/event_handler` route
+  # Before each request to the `/event_handler` route
   before '/event_handler' do
     get_payload_request(request)
     verify_webhook_signature
-
-    # This Quickstart example uses the repository name in the webhook with
-    # command line utilities. For security reasons, you should validate the
-    # repository name to ensure that a bad actor isn't attempting to execute
-    # arbitrary commands or inject false repository names. If a repository name
-    # is provided in the webhook, validate that it consists only of latin
-    # alphabetic characters, `-`, and `_`.
-    unless @payload['repository'].nil?
-      halt 400 if (@payload['repository']['name'] =~ /[0-9A-Za-z\-\_]+/).nil?
-    end
-
-    authenticate_app
-    # Authenticate the app installation in order to run API operations
-    authenticate_installation(@payload)
   end
 
 
   post '/event_handler' do
-    # Get the event type from the HTTP_X_GITHUB_EVENT header
-    case request.env['HTTP_X_GITHUB_EVENT']
 
-    when 'check_suite'
-      # A new check_suite has been created. Create a new check run with status queued
-      if @payload['action'] === 'requested' || @payload['action'] === 'rerequested'
+  case request.env['HTTP_X_GITHUB_EVENT']
+  when 'check_run'
+    sha = @payload['check_run'].nil? ? @payload['check_suite']['head_sha'] : @payload['check_run']['head_sha']
+
+    # Check that the event is being sent to this app
+    if @payload['check_run']['app']['id'].to_s === APP_IDENTIFIER
+      case @payload['action']
+      when 'created'
+        initiate_check_run
+      when 'rerequested'
         create_check_run
       end
-
-    when 'check_run'
-      # Check that the event is being sent to this app
-      if @payload['check_run']['app']['id'].to_s === APP_IDENTIFIER
-        case @payload['action']
-        when 'created'
-          initiate_check_run
-        when 'rerequested'
-          create_check_run
-        when 'requested_action'
-          take_requested_action
-        end
-      end
     end
+
+  when 'check_suite'
+    # A new check_suite has been created. Create a new check run with status queued
+    if @payload['action'] == 'requested' || @payload['action'] == 'rerequested'
+      create_check_run
+    end
+  end
+    # # # # # # # # # # # #
+    # ADD YOUR CODE HERE  #
+    # # # # # # # # # # # #
 
     200 # success status
   end
@@ -81,9 +90,30 @@ class GHAapp < Sinatra::Application
 
   helpers do
 
+
+    # Clones the repository to the current working directory, updates the
+    # contents using Git pull, and checks out the ref.
+    #
+    # full_repo_name  - The owner and repo. Ex: octocat/hello-world
+    # repository      - The repository name
+    # default_branch  - The default branch name
+    # ref             - The branch, commit SHA, or tag to check out
+    def clone_repository(full_repo_name, repository, default_branch, ref)
+      @git = Git.clone("https://x-access-token:#{@installation_token.to_s}@github.com/#{full_repo_name}.git", repository, :branch => default_branch)
+      pwd = Dir.getwd()
+      Dir.chdir(repository)
+      @git.checkout(ref)
+      Dir.chdir(pwd)
+      @git
+    end
+
     # Create a new check run with the status queued
     def create_check_run
-      # At the time of writing, Octokit does not support the Checks API, but
+      authenticate_app
+      # Authenticate the app installation in order to run API operations
+      authenticate_installation(@payload)
+
+      # # At the time of writing, Octokit does not support the Checks API yet, but
       # it does provide generic HTTP methods you can use:
       # https://developer.github.com/v3/checks/runs/#create-a-check-run
       check_run = @installation_client.post(
@@ -92,175 +122,194 @@ class GHAapp < Sinatra::Application
           # This header allows for beta access to Checks API
           accept: 'application/vnd.github.antiope-preview+json',
           # The name of your check run.
-          name: 'Octo RuboCop',
+          name: report_operating_system(),
           # The payload structure differs depending on whether a check run or a check suite event occurred.
           head_sha: @payload['check_run'].nil? ? @payload['check_suite']['head_sha'] : @payload['check_run']['head_sha']
         }
       )
-
-      # You requested the creation of a check run from GitHub. Now, you'll wait
-      # to get confirmation from GitHub, in the form of a webhook, that it was
-      # created before starting CI. Equivalently, a 201 response from
-      # POST /repos/:owner/:repo/check-runs could also be used as confirmation.
     end
 
     # Start the CI process
     def initiate_check_run
-      # Once the check run is created, you'll update the status of the check run
-      # to 'in_progress' and run the CI process. When the CI finishes, you'll
-      # update the check run status to 'completed' and add the CI results.
+      run_conclusion = "failure"
+      begin
+        full_repo_name = @payload['repository']['full_name']
+        repository     = @payload['repository']['name']
+        default_branch = @payload['repository']['default_branch']
+        head_sha       = @payload['check_run']['head_sha']
 
-      # At the time of writing, Octokit doesn't support the Checks API, but
-      # it does provide generic HTTP methods you can use:
-      # https://developer.github.com/v3/checks/runs/#update-a-check-run
-      updated_check_run = @installation_client.patch(
-        "repos/#{@payload['repository']['full_name']}/check-runs/#{@payload['check_run']['id']}",
-        {
-          accept: 'application/vnd.github.antiope-preview+json',
-          name: 'Octo RuboCop',
-          status: 'in_progress',
-          started_at: Time.now.utc.iso8601
-        }
-      )
+        workdir = ENV['HOME'] + "/build-output/" + head_sha
+        logdir = ENV['PWD'] + "/public/#{head_sha}"
+        worklog = "#{logdir}/output.log"
+        `rm -rf #{workdir} #{logdir}`
+        `mkdir -p #{workdir} #{logdir}`
+        `touch #{worklog}`
+        Dir.chdir(workdir)
 
-      # ***** RUN A CI TEST *****
-      # Ideally this would be performed async, so you could return immediately.
-      # But for now you'll do a simulated CI process syncronously, and update
-      # the check run right here.
-      full_repo_name = @payload['repository']['full_name']
-      repository     = @payload['repository']['name']
-      head_sha       = @payload['check_run']['head_sha']
+        puts "cloning at SHA1 " + head_sha
+        git = clone_repository(full_repo_name, repository, default_branch, head_sha)
+        diff = @git.diff("#{head_sha}^", head_sha)
 
-      clone_repository(full_repo_name, repository, head_sha)
+        diff_out = File.new("#{workdir}/diff.out", "w")
+        diff_out.puts(diff)
+        diff_out.close
 
-      # Run RuboCop on all files in the repository
-      @report = `rubocop '#{repository}' --format json`
-      logger.debug @report
-      `rm -rf #{repository}`
-      @output = JSON.parse @report
-      annotations = []
-      # You can create a maximum of 50 annotations per request to the Checks
-      # API. To add more than 50 annotations, use the "Update a check run" API
-      # endpoint. This example code limits the number of annotations to 50.
-      # See https://developer.github.com/v3/checks/runs/#update-a-check-run
-      # for details.
-      max_annotations = 50
+        puts "creating mk.conf.frag"
+        mk_conf_frag = File.new("#{workdir}/mk.conf.frag", "w")
+        mk_conf_frag.puts("SKIP_LICENSE_CHECK=yes")
+        mk_conf_frag.close
+        
+        puts "bootstrapping pbulk.sh, output at #{worklog}"
+        `env PKGSRCDIR=#{workdir}/pkgsrc \
+             PBULKPREFIX=#{workdir}/pbulk \
+             PREFIX=#{workdir}/pkg \
+             PACKAGES=#{workdir}/packages \
+             BULKLOG=#{logdir}/ \
+             TMPDIR=#{workdir} \
+          sh #{workdir}/pkgsrc/mk/pbulk/pbulk.sh -l -u -c mk.conf.frag 2>&1 |tee #{worklog}`
 
-      # RuboCop reports the number of errors found in 'offense_count'
-      if @output['summary']['offense_count'] == 0
-        conclusion = 'success'
-      else
-        conclusion = 'neutral'
-        @output['files'].each do |file|
+        puts "creating pbulk.list for diff " + String(diff)
+        pbulk_list = File.new("#{workdir}/pbulk/etc/pbulk.list", "w")
+        pbulk_list.puts(generate_limited_list(diff))
+        pbulk_list.close
 
-          # Only parse offenses for files in this app's repository
-          file_path = file['path'].gsub(/#{repository}\//,'')
-          annotation_level = 'notice'
+        puts "running bulkbuild, output at #{worklog}"
+        `#{workdir}/pbulk/bin/bulkbuild 2>&1 |tee #{worklog}`
 
-          # Parse each offense to get details and location
-          file['offenses'].each do |offense|
-            # Limit the number of annotations to 50
-            next if max_annotations == 0
-            max_annotations -= 1
+        puts "inspecting errors..."
+        error_size = File.size("#{logdir}/meta/error")
+        if error_size > 0
+          puts "some packages failed, marking as failure"
+          run_conclusion = "failure"
+          `echo "List of failed packages:"; cat #{logdir}/meta/error |tee #{worklog}`
+        else
+          puts "no failures, success"
+          run_conclusion = "success"
+        end
+      ensure
+        `rm -rf #{workdir}`
 
-            start_line   = offense['location']['start_line']
-            end_line     = offense['location']['last_line']
-            start_column = offense['location']['start_column']
-            end_column   = offense['location']['last_column']
-            message      = offense['message']
+        authenticate_app
+        # Authenticate the app installation in order to run API operations
+        authenticate_installation(@payload)
 
-            # Create a new annotation for each error
-            annotation = {
-              path: file_path,
-              start_line: start_line,
-              end_line: end_line,
-              annotation_level: annotation_level,
-              message: message
-            }
-            # Annotations only support start and end columns on the same line
-            if start_line == end_line
-              annotation.merge({start_column: start_column, end_column: end_column})
-            end
+        # Mark the check run as complete!
+        updated_check_run = @installation_client.patch(
+          "repos/#{@payload['repository']['full_name']}/check-runs/#{@payload['check_run']['id']}",
+          {
+            # This header is necessary for beta access to Checks API
+            accept: 'application/vnd.github.antiope-preview+json',
+            name: report_operating_system(),
+            status: 'completed',
+            output: {
+              title: 'build report',
+              text: report_failures(logdir),
+              summary: "http://164.90.236.131:8000/#{head_sha}/meta/report.html",
+            },
+            conclusion: run_conclusion,
+            completed_at: Time.now.utc.iso8601
+          }
+        )
+      end
+    end
 
-            annotations.push(annotation)
+    # Outputs a description for the running platform
+    def report_operating_system()
+      os_name=`uname`.chomp
+      os_version=`uname -r`.chomp
+      os_arch=`uname -m`.chomp
+
+      if os_name.eql?("Linux")
+          if File.exists?("/etc/os-release")
+                os_name=`source /etc/os-release && echo $NAME`.chomp
+                    os_version=`source /etc/os-release && echo $VERSION_ID`.chomp
+                      end
+      end
+
+      if os_name.eql?("NetBSD")
+          os_arch=`uname -p`.chomp
+      end
+
+      "#{os_name} #{os_version}/#{os_arch}"
+    end
+
+    # Outputs a string containing a Markdown-formatted report of failures
+    #
+    # logdir - directory containing BULKLOG (directory that contains meta/error)
+    def report_failures(logdir)
+      def report_failure(failed_package, logdir)
+        reverse_stages = ["install.log", "build.log", "configure.log", "checksum.log", "depends.log", "pre-clean.log"]
+
+        logs_filenames = Hash.new
+
+        last_stage = ""
+        reverse_stages.each do |stage_log|
+          if(File.exists?("#{logdir}/#{failed_package}/#{stage_log}"))
+            last_stage = stage_log
+            break
           end
         end
-      end
 
-      # Updated check run summary and text parameters
-      summary = "Octo RuboCop summary\n-Offense count: #{@output['summary']['offense_count']}\n-File count: #{@output['summary']['target_file_count']}\n-Target file count: #{@output['summary']['inspected_file_count']}"
-      text = "Octo RuboCop version: #{@output['metadata']['rubocop_version']}"
+        log_content = IO.readlines("#{logdir}/#{failed_package}/#{last_stage}").last(100).join('')
 
-      # Mark the check run as complete! And if there are warnings, share them.
-      updated_check_run = @installation_client.patch(
-        "repos/#{@payload['repository']['full_name']}/check-runs/#{@payload['check_run']['id']}",
-        {
-          accept: 'application/vnd.github.antiope-preview+json',
-          name: 'Octo RuboCop',
-          status: 'completed',
-          conclusion: conclusion,
-          completed_at: Time.now.utc.iso8601,
-          output: {
-            title: 'Octo RuboCop',
-            summary: summary,
-            text: text,
-            annotations: annotations
-          },
-          actions: [{
-            label: 'Fix this',
-            description: 'Automatically fix all linter notices.',
-            identifier: 'fix_rubocop_notices'
-          }]
+        %{
+<details open=""><summary>#{failed_package} #{last_stage}</summary>
+<p>
+
+```
+#{log_content}
+```
+
+</p>
+</details>
         }
-      )
-
-    end
-
-    # Handles the check run `requested_action` event
-    # See https://developer.github.com/v3/activity/events/types/#checkrunevent
-    def take_requested_action
-      full_repo_name = @payload['repository']['full_name']
-      repository     = @payload['repository']['name']
-      head_branch    = @payload['check_run']['check_suite']['head_branch']
-
-      if (@payload['requested_action']['identifier'] == 'fix_rubocop_notices')
-        clone_repository(full_repo_name, repository, head_branch)
-
-        # Sets your commit username and email address
-        @git.config('user.name', ENV['GITHUB_APP_USER_NAME'])
-        @git.config('user.email', ENV['GITHUB_APP_USER_EMAIL'])
-
-        # Automatically correct RuboCop style errors
-        @report = `rubocop '#{repository}/*' --format json --auto-correct`
-
-        pwd = Dir.getwd()
-        Dir.chdir(repository)
-        begin
-          @git.commit_all('Automatically fix Octo RuboCop notices.')
-          @git.push("https://x-access-token:#{@installation_token.to_s}@github.com/#{full_repo_name}.git", head_branch)
-        rescue
-          # Nothing to commit!
-          puts 'Nothing to commit'
-        end
-        Dir.chdir(pwd)
-        `rm -rf '#{repository}'`
       end
+
+      failure_report = ""
+      File.readlines("#{logdir}/meta/error").each do |failed_package|
+        failure_report = failure_report + report_failure(failed_package.chomp, logdir)
+      end
+
+      failure_report
     end
 
-    # Clones the repository to the current working directory, updates the
-    # contents using Git pull, and checks out the ref.
-    #
-    # full_repo_name  - The owner and repo. Ex: octocat/hello-world
-    # repository      - The repository name
-    # ref             - The branch, commit SHA, or tag to check out
-    def clone_repository(full_repo_name, repository, ref)
-      @git = Git.clone("https://x-access-token:#{@installation_token.to_s}@github.com/#{full_repo_name}.git", repository)
-      pwd = Dir.getwd()
-      Dir.chdir(repository)
-      @git.pull
-      @git.checkout(ref)
-      Dir.chdir(pwd)
+    # returns a string of packages were changed on a diff
+    # in a format suitable to use as a limited_list file
+    def generate_limited_list(diff)
+      def is_pkg_change?(pkgdir)
+        if pkgdir.start_with?("mk/")
+          return false
+        end
+
+        if pkgdir.start_with?("doc/")
+          return false
+        end
+
+        if pkgdir.split("/").length < 3
+          return false
+        end
+
+        return true
+      end
+
+      # omit Makefile, patches/patch-aa... component
+      def canonicalize_pkgdir(pkgdir)
+        return pkgdir[/^[^\/]+\/[^\/]+/]
+      end
+
+      diff_paths = diff.map{ |diff| diff.path }
+
+      pkgs = Array[]
+
+      diff_paths.each do |diff_path|
+        if is_pkg_change?(diff_path)
+          pkgs.push(canonicalize_pkgdir(diff_path))
+        end
+      end
+
+      return pkgs.nil? ? nil : pkgs.uniq.join("\n")
     end
+
 
     # Saves the raw payload and converts the payload to JSON format
     def get_payload_request(request)
@@ -272,7 +321,7 @@ class GHAapp < Sinatra::Application
       begin
         @payload = JSON.parse @payload_raw
       rescue => e
-        fail  "Invalid JSON (#{e}): #{@payload_raw}"
+        fail  'Invalid JSON (#{e}): #{@payload_raw}'
       end
     end
 
@@ -286,7 +335,7 @@ class GHAapp < Sinatra::Application
           # The time that this JWT was issued, _i.e._ now.
           iat: Time.now.to_i,
 
-          # JWT expiration time (10 minute maximum)
+          # JWT expiration time (10 minutes maximum)
           exp: Time.now.to_i + (10 * 60),
 
           # Your GitHub App's identifier number
