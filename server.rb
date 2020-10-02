@@ -139,7 +139,7 @@ class GHAapp < Sinatra::Application
         head_sha       = @payload['check_run']['head_sha']
 
         workdir = ENV['HOME'] + "/build-output/" + head_sha
-        logdir = ENV['PWD'] + "/public/#{head_sha}"
+        logdir = __dir__ + "/public/#{head_sha}"
         worklog = "#{logdir}/output.log"
         `rm -rf #{workdir} #{logdir}`
         `mkdir -p #{workdir} #{logdir}`
