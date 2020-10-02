@@ -193,6 +193,8 @@ class GHAapp < Sinatra::Application
         # Authenticate the app installation in order to run API operations
         authenticate_installation(@payload)
 
+        hostname=`hostname`.chomp
+
         # Mark the check run as complete!
         updated_check_run = @installation_client.patch(
           "repos/#{@payload['repository']['full_name']}/check-runs/#{@payload['check_run']['id']}",
@@ -204,7 +206,7 @@ class GHAapp < Sinatra::Application
             output: {
               title: 'build report',
               text: report_failures(logdir),
-              summary: "http://164.90.236.131:8000/#{head_sha}/meta/report.html",
+              summary: "http://#{hostname}:8000/#{head_sha}/meta/report.html",
             },
             conclusion: run_conclusion,
             completed_at: Time.now.utc.iso8601
